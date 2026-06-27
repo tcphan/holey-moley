@@ -1,5 +1,27 @@
 import numpy as np
+from numba import njit
 from scipy.spatial.distance import cdist
+
+@njit
+def _compute_edges_numba(dist_matrix, max_epsilon):
+    """
+    Sped up with Numba: Fast loop to extract valid edges.
+    Returns arrays which Numba handles perfectly.
+    """
+    n_samples = dist_matrix.shape[0]
+    from_nodes = []
+    to_nodes = []
+    distances = []
+    
+    for i in range(n_samples):
+        for j in range(i + 1, n_samples):
+            d = dist_matrix[i, j]
+            if d <= max_epsilon:
+                from_nodes.append(i)
+                to_nodes.append(j)
+                distances.append(d)
+                
+    return from_nodes, to_nodes, distances
 
 class VietorisRips:
     """
@@ -47,17 +69,17 @@ class VietorisRips:
 
         n_samples = dist_matrix.shape[0]
 
+        # Use Numba-accelerated helper function for the heavy O(N^2) distance check loop
+        from_nodes, to_nodes, distances = _compute_edges_numba(dist_matrix, self.max_epsilon)
+
         # Pre-calculate an adjacency list of neighbors for each vertex
         # Only keep neighbors where u < v to avoid double-counting, and within max_epsilon
         adj_list = {i: set() for i in range(n_samples)}
         edges = []
-        
-        for i in range(n_samples):
-            for j in range(i + 1, n_samples):
-                d = dist_matrix[i, j]
-                if d <= self.max_epsilon:
-                    adj_list[i].add(j)
-                    edges.append(((i, j), d))
+
+        for u, v, d in zip(from_nodes, to_nodes, distances):
+            adj_list[u].add(v)
+            edges.append(((u, v), d))
         
         # Dictionary to store simplices by dimension
         # Key: dimension, Value: list of tuples (simplex, birth_time)
