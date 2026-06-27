@@ -46,6 +46,18 @@ class VietorisRips:
             dist_matrix = cdist(X, X, metric='euclidean')
 
         n_samples = dist_matrix.shape[0]
+
+        # Pre-calculate an adjacency list of neighbors for each vertex
+        # Only keep neighbors where u < v to avoid double-counting, and within max_epsilon
+        adj_list = {i: set() for i in range(n_samples)}
+        edges = []
+        
+        for i in range(n_samples):
+            for j in range(i + 1, n_samples):
+                d = dist_matrix[i, j]
+                if d <= self.max_epsilon:
+                    adj_list[i].add(j)
+                    edges.append(((i, j), d))
         
         # Dictionary to store simplices by dimension
         # Key: dimension, Value: list of tuples (simplex, birth_time)
@@ -53,28 +65,30 @@ class VietorisRips:
         
         # Dimension 0: Vertices
         simplices_by_dim[0] = [((i,), 0.0) for i in range(n_samples)]
-        
-        # Iteratively build higher dimensions
-        for d in range(1, self.max_dim + 1):
+        # Dimension 1: Edges
+        simplices_by_dim[1] = edges
+
+        # Inductive expansion using intersection of neighbor sets
+        for d in range(2, self.max_dim + 1):
             simplices_by_dim[d] = []
             # Generate d-simplices from (d-1)-simplices
             for face, face_birth in simplices_by_dim[d-1]:
+                # Find the common neighbors of ALL vertices in the current face
+                # We start with the neighbors of the first vertex
+                common_neighbors = adj_list[face[0]]
+                for v in face[1:]:
+                    common_neighbors = common_neighbors.intersection(adj_list[v])
+                
+                # Filter to ensure we only look at vertices greater than the last vertex
+                # to maintain lexicographical order and avoid duplicates
                 last_v = face[-1]
-                for u in range(last_v + 1, n_samples):
-                    # Check if all edges between u and face vertices are within max_epsilon
-                    valid = True
-                    max_edge = face_birth
-                    for v in face:
-                        dist = dist_matrix[u, v]
-                        if dist > self.max_epsilon:
-                            valid = False
-                            break
-                        if dist > max_edge:
-                            max_edge = dist
-                    
-                    if valid:
-                        new_simplex = face + (u,)
-                        simplices_by_dim[d].append((new_simplex, max_edge))
+                valid_extensions = [u for u in common_neighbors if u > last_v]
+                
+                for u in valid_extensions:
+                    new_simplex = face + (u,)
+                    # The birth time is the maximum distance between the new vertex u and existing face vertices
+                    max_edge = max(face_birth, max(dist_matrix[u, v] for v in face))
+                    simplices_by_dim[d].append((new_simplex, max_edge))
 
         # Flatten all simplices into a single list
         all_simplices = []
