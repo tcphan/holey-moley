@@ -42,7 +42,7 @@ class VietorisRips:
         self.max_dim = max_dim
         self.max_epsilon = max_epsilon
 
-    def fit_transform(self, X, is_distance_matrix=False):
+    def fit_transform(self, X, is_distance_matrix=False, distance_metric="euclidean"):
         """
         Computes the Vietoris-Rips filtration for the input data.
 
@@ -53,6 +53,8 @@ class VietorisRips:
         is_distance_matrix : bool, default=False
             If True, X is assumed to be a pairwise distance matrix. Otherwise, 
             it is assumed to be a point cloud.
+        distance_metric : str, default="euclidean"
+            The metric to use for distance calculations.
 
         Returns:
         --------
@@ -65,7 +67,7 @@ class VietorisRips:
         if is_distance_matrix:
             dist_matrix = X
         else:
-            dist_matrix = cdist(X, X, metric='euclidean')
+            dist_matrix = cdist(X, X, metric=distance_metric)
 
         n_samples = dist_matrix.shape[0]
 
