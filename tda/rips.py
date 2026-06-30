@@ -6,7 +6,6 @@ from scipy.spatial.distance import cdist
 def _compute_edges_numba(dist_matrix, max_epsilon):
     """
     Sped up with Numba: Fast loop to extract valid edges.
-    Returns arrays which Numba handles perfectly.
     """
     n_samples = dist_matrix.shape[0]
     from_nodes = []
@@ -129,3 +128,90 @@ class VietorisRips:
 
         filtration = sorted(all_simplices, key=filtration_key)
         return filtration
+
+def compute_birth_death_pairs(filtration):
+    """
+    Computes birth-death pairs from a sorted Vietoris-Rips filtration.
+    
+    Parameters:
+    -----------
+    filtration : list of tuples
+        The sorted output from VietorisRips.fit_transform()
+        
+    Returns:
+    --------
+    persistence_pairs : dict
+        A dictionary mapping dimension -> list of (birth_time, death_time) tuples.
+    """
+    simplex_to_idx = {simplex: i for i, (simplex, _) in enumerate(filtration)}
+    num_simplices = len(filtration)
+    
+    # pivot_to_col[r] = c means column c has its lowest '1' at row r
+    pivot_to_col = {}
+    # Track which columns (death simplices) cleared out completely
+    is_cycle = np.ones(num_simplices, dtype=bool)
+    
+    intervals = {}
+
+    for col_idx in range(num_simplices):
+        simplex, birth_time = filtration[col_idx]
+        dim = len(simplex) - 1
+        
+        if dim not in intervals:
+            intervals[dim] = []
+
+        # 1. Compute boundary over Z2
+        boundary_indices = []
+        if dim > 0:
+            for i in range(len(simplex)):
+                face = simplex[:i] + simplex[i+1:]
+                if face in simplex_to_idx:
+                    boundary_indices.append(simplex_to_idx[face])
+            boundary_indices.sort(reverse=True)
+
+        # 2. Reduce column
+        while boundary_indices:
+            pivot_row = boundary_indices[0]
+            
+            if pivot_row in pivot_to_col:
+                other_col = pivot_to_col[pivot_row]
+                other_boundary = []
+                other_simplex = filtration[other_col][0]
+                for i in range(len(other_simplex)):
+                    f = other_simplex[:i] + other_simplex[i+1:]
+                    if f in simplex_to_idx:
+                        other_boundary.append(simplex_to_idx[f])
+                
+                boundary_indices = list(set(boundary_indices) ^ set(other_boundary))
+                boundary_indices.sort(reverse=True)
+            else:
+                # pivot_row is born, col_idx kills it
+                pivot_to_col[pivot_row] = col_idx
+                is_cycle[col_idx] = False  # col_idx is a destroyer, not a creator
+                
+                birth_dim = len(filtration[pivot_row][0]) - 1
+                b_time = filtration[pivot_row][1]
+                d_time = birth_time # The current simplex's birth time is the death time of the feature
+                
+                if birth_dim not in intervals:
+                    intervals[birth_dim] = []
+                
+                # Only record features that have a valid lifetime
+                if d_time > b_time:
+                    intervals[birth_dim].append((b_time, d_time))
+                break
+
+    # 3. Collect essential features (cycles that never get killed)
+    for col_idx in range(num_simplices):
+        # If a column was completely cleared AND it never acted as a pivot row for something else
+        if is_cycle[col_idx] and (col_idx not in pivot_to_col):
+            simplex, birth_time = filtration[col_idx]
+            dim = len(simplex) - 1
+            
+            if dim not in intervals:
+                intervals[dim] = []
+            
+            # These features live forever (death = infinity)
+            intervals[dim].append((birth_time, float('inf')))
+
+    return intervals
