@@ -248,40 +248,6 @@ class VietorisRips:
             for row in self.all_simplices_df.filter(pl.col("dim") == dim).to_dicts()
         ]
 
-    def __create_boundary_matrix(self, simplex_to_idx):
-        """
-        Internal helper to construct the boundary matrix for the Rips filtration.
-
-        Parameters:
-        -----------
-        simplex_to_idx : dict
-            A dictionary mapping each simplex (tuple of vertex indices) to its column index in the matrix.
-
-        Returns:
-        --------
-        boundaries : list
-            A list of numpy arrays, where each array contains the row indices of the faces
-            (lower-dimensional simplices) of the simplex at the corresponding column index.
-        """
-
-        simplices = list(simplex_to_idx.keys())
-        boundaries = []
-        for col_idx in range(len(simplices)):
-            simplex = simplices[col_idx]
-            dim = len(simplex) - 1
-            if dim == 0:
-                boundaries.append(np.array([], dtype=np.int32))
-            else:
-                faces = []
-                for i in range(len(simplex)):
-                    face = simplex[:i] + simplex[i + 1 :]
-                    idx = simplex_to_idx.get(face, -1)
-                    if idx != -1:
-                        faces.append(idx)
-                faces.sort(reverse=True)
-                boundaries.append(np.array(faces, dtype=np.int32))
-        return boundaries
-
     def compute_birth_death_pairs(self):
         """
         Computes birth-death pairs from the filtration.
@@ -317,55 +283,97 @@ class VietorisRips:
             tuple(v for v in row if v != -1): i for i, row in enumerate(vertices_matrix)
         }
 
-        # Calculate the boundary matrix
-        boundaries = self.__create_boundary_matrix(simplex_to_idx)
-
-        # pivot_to_col[r] stores the column index c that has its pivot at row r (-1 means unassigned)
-        pivot_to_col = np.full(num_simplices, -1, dtype=np.int32)
-        # is_cycle represents if a simplex is a cycle (has no pivot)
-        is_cycle = np.ones(num_simplices, dtype=np.bool_)
-
-        # Core boundary matrix reduction Loop
+        # Calculate the cohomology boundary matrix
+        coboundaries = [[] for _ in range(num_simplices)]
         for col_idx in range(num_simplices):
             dim = dimensions[col_idx]
-            if dim == 0:
+            # Vertices of the current simplex
+            simplex = [v for v in vertices_matrix[col_idx] if v != -1]
+
+            if dim > 0:
+                # Homology looks at its faces. Cohomology uses faces to tell the lower-dimensional face that this simplex is part of its coboundary.
+                for i in range(len(simplex)):
+                    face = tuple(simplex[:i] + simplex[i + 1 :])
+                    face_idx = simplex_to_idx.get(face, -1)
+                    if face_idx != -1:
+                        # Append the current simplex as a cofacet of its face
+                        coboundaries[face_idx].append(col_idx)
+
+        for i in range(num_simplices):
+            coboundaries[i].sort()
+
+        # Dictionary that maps a pivot row to its column vector
+        cocycle_basis = {}
+        pivot_to_row = np.full(num_simplices, -1, dtype=np.int32)
+        # Track columns that are mathematically guaranteed to reduce to zero
+        cleared = np.zeros(num_simplices, dtype=np.bool_)
+
+        # Core coboundary matrix reduction Loop
+        for col_idx in range(num_simplices):
+            dim = dimensions[col_idx]
+
+            # Skip max dimension because it cannot destroy anything or have a coboundary
+            if dim == self.max_dim:
                 continue
 
-            # Local working copy of the boundary for this column
-            boundary_indices = list(boundaries[col_idx])
+            # If this column was marked as cleared by a higher dimension, skip its reduction entirely!
+            # Its boundary becomes implicitly empty.
+            if cleared[col_idx]:
+                continue
 
-            while boundary_indices:
-                pivot_row = boundary_indices[0]
-                other_col = pivot_to_col[pivot_row]
+            # Initialize a new active cocycle tracking vector containing just this simplex
+            current_cocycle = {col_idx}
+            # Find the lowest un-eliminated entry in the coboundary matrix
+            # entries are checked dynamically
+            coboundary_elements = list(coboundaries[col_idx])
+
+            while coboundary_elements:
+                # Pivot for cohomology is the FIRST (earliest entering) element in the coboundary
+                pivot_row = coboundary_elements[0]
+
+                # Check if this pivot has already been claimed by a different cocycle
+                other_col = pivot_to_row[pivot_row]
 
                 if other_col != -1:
-                    # Vectorized-style XOR operation using Python sets (highly optimized in C)
-                    boundary_indices = list(
-                        set(boundary_indices) ^ set(boundaries[other_col])
-                    )
-                    boundary_indices.sort(reverse=True)
-                else:
-                    # pivot_row is born, col_idx kills it
-                    pivot_to_col[pivot_row] = col_idx
-                    # col_idx is now a boundary, not a cycle
-                    is_cycle[col_idx] = False
+                    # XOR/Symmetric difference with the existing claimed cocycle's coboundary
+                    # This eliminates the leading pivot element
+                    current_cocycle = current_cocycle ^ cocycle_basis[other_col]
 
-                    birth_dim = dimensions[pivot_row]
-                    b_time = birth_times[pivot_row]
-                    d_time = birth_times[
-                        col_idx
-                    ]  # The current simplex's birth time is the death time
+                    # Recompute the active coboundary elements of the combined cocycle
+                    new_coboundary = set()
+                    for c_idx in current_cocycle:
+                        new_coboundary = new_coboundary ^ set(coboundaries[c_idx])
+
+                    coboundary_elements = sorted(list(new_coboundary))
+                else:
+                    # A valid pair is found
+                    pivot_to_row[pivot_row] = col_idx
+                    cocycle_basis[col_idx] = current_cocycle
+
+                    # Clearing property: since pivot_row is a creator paired with a destroyer,
+                    # its own column is guaranteed to reduce to zero. Mark it to be skipped!
+                    cleared[pivot_row] = True
+
+                    birth_time = birth_times[col_idx]
+                    death_time = birth_times[pivot_row]
+                    birth_dim = dim
 
                     if birth_dim not in self.persistence_pairs:
                         self.persistence_pairs[birth_dim] = []
 
-                    if d_time > b_time:
-                        self.persistence_pairs[birth_dim].append((b_time, d_time))
+                    if death_time > birth_time:
+                        self.persistence_pairs[birth_dim].append(
+                            (birth_time, death_time)
+                        )
                     break
 
         # Collect essential features (unpaired cycles that live to infinity)
         for col_idx in range(num_simplices):
-            if is_cycle[col_idx] and (pivot_to_col[col_idx] == -1):
+            if (
+                (dimensions[col_idx] < self.max_dim)
+                and (not cleared[col_idx])
+                and (col_idx not in cocycle_basis)
+            ):
                 dim = dimensions[col_idx]
                 if dim not in self.persistence_pairs:
                     self.persistence_pairs[dim] = []
