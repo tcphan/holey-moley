@@ -7,7 +7,9 @@ class VietorisRips:
     Constructs the Vietoris-Rips filtration of a point cloud or distance matrix.
     """
 
-    def __init__(self, max_dim=2, max_epsilon=float("inf")):
+    def __init__(
+        self, max_dim: int = 2, max_epsilon=float("inf"), batch_size: int = 1000
+    ):
         """
         Initialize the Vietoris-Rips complex builder.
 
@@ -18,11 +20,68 @@ class VietorisRips:
             1 for edges, 2 for triangles).
         max_epsilon : float
             The maximum filtration value (threshold distance) for adding simplices.
+        batch_size : int
+            The size of the batches to process.
         """
         self.max_dim = max_dim
         self.max_epsilon = max_epsilon
+        self.batch_size = batch_size
         self.filtration = None
         self.persistence_pairs = None
+
+    def __batch_distances(self, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Calculates the distances between points in data batches for memory efficiency.
+
+        Parameters:
+        -----------
+        df : pl.DataFrame
+            Dataframe of input features.
+
+        Returns:
+        --------
+        pl.DataFrame
+            A dataframe of edge distances.
+        """
+
+        distance_chunks = []
+        n_samples = df.select(pl.len()).collect().item()
+        for i in range(0, n_samples, self.batch_size):
+            chunk_a = df.slice(i, self.batch_size)
+
+            # Only compare against chunks further down to avoid redundant pairs
+            for j in range(i, n_samples, self.batch_size):
+                chunk_b = df.slice(j, self.batch_size)
+
+                # Cross join
+                # To optimize, filter first where a.id < b.id to avoid self-distance
+                pairs_chunk = chunk_a.join(
+                    chunk_b, how="cross", suffix="_right"
+                ).filter(pl.col("id") < pl.col("id_right"))
+
+                # Calculate Euclidean distance and filter by max_epsilon
+                distance_expr = pl.sum_horizontal(
+                    [
+                        (pl.col(c) - pl.col(f"{c}_right")).pow(2)
+                        for c in df.collect_schema().names()
+                        if c not in ["id", "id_right"]
+                    ]
+                ).sqrt()
+
+                distance_chunk = (
+                    pairs_chunk.with_columns(distance_expr.alias("distance"))
+                    .filter(pl.col("distance") <= self.max_epsilon)
+                    .select(["id", "id_right", "distance"])
+                )
+
+                # Check if distance_chunk is empty before appending
+                is_empty = distance_chunk.select(pl.len()).collect().item() == 0
+                if not is_empty:
+                    distance_chunks.append(distance_chunk)
+
+        # Stitch just the valid sparse edges together
+        distances = pl.concat(distance_chunks).collect(streaming=True)
+        return distances
 
     def fit_transform(self, df: pl.DataFrame) -> list:
         """
@@ -45,23 +104,8 @@ class VietorisRips:
             df.with_row_index("id").with_columns([pl.col("id").cast(pl.Int64)]).lazy()
         )
 
-        # Compute pairwise Euclidean distance
-        # To optimize, filter first where a.id < b.id to avoid self-distance
-        pairs_df = df_with_id.join(df_with_id, how="cross", suffix="_right").filter(
-            pl.col("id") < pl.col("id_right")
-        )
-        feature_cols = [c for c in df.columns]
-        distance_expr = pl.sum_horizontal(
-            [(pl.col(c) - pl.col(f"{c}_right")) ** 2 for c in feature_cols]
-        ).sqrt()
-
-        # Filter edges by max_epsilon
-        edges_base = (
-            pairs_df.with_columns(distance_expr.alias("distance"))
-            .filter(pl.col("distance") <= self.max_epsilon)
-            .select(["id", "id_right", "distance"])
-            .collect(streaming=True)
-        )
+        # Retrieve distance matrix
+        edges_base = self.__batch_distances(df=df_with_id)
 
         # Initialize simplices list by dimension
         simplices_by_dim = {}
