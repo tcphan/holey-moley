@@ -27,7 +27,6 @@ class VietorisRips:
         self.max_epsilon = max_epsilon
         self.batch_size = batch_size
         self.filtration = None
-        self.persistence_pairs = None
 
     def __batch_distances(self, df: pl.DataFrame) -> pl.DataFrame:
         """
@@ -83,7 +82,7 @@ class VietorisRips:
         distances = pl.concat(distance_chunks).collect(streaming=True)
         return distances
 
-    def fit_transform(self, df: pl.DataFrame) -> list:
+    def fit_transform(self, df: pl.DataFrame) -> None:
         """
         Computes the Vietoris-Rips filtration for the input data.
 
@@ -185,16 +184,35 @@ class VietorisRips:
             for d in range(self.max_dim + 1)
             if d in simplices_by_dim and not simplices_by_dim[d].is_empty()
         ]
-        all_simplices_df = (
+        self.all_simplices_df = (
             pl.concat(all_dfs, how="diagonal")
             .lazy()
             .sort(["birth_time", "dim"])
             .collect(streaming=True)
         )
 
+    def get_all_simplices(self) -> list:
+        """
+        Retrieves all simplices in the filtration.
+
+        Returns:
+        --------
+        list of tuples
+            A sorted list of simplices forming the filtration.
+            Each element is a tuple: (simplex_tuple, birth_time)
+            where simplex_tuple is a tuple of vertex indices (sorted) and birth_time is a float.
+        """
+
+        if self.all_simplices_df is None:
+            raise ValueError(
+                "Filtration has not been computed. Call fit_transform() first."
+            )
+
         self.filtration = []
-        vertex_cols = [c for c in all_simplices_df.columns if c.startswith("v_")]
-        for row in all_simplices_df.select([*vertex_cols, "birth_time"]).to_dicts():
+        vertex_cols = [c for c in self.all_simplices_df.columns if c.startswith("v_")]
+        for row in self.all_simplices_df.select(
+            [*vertex_cols, "birth_time"]
+        ).to_dicts():
             # Gather all non-null vertex indices into a sorted tuple
             simplex_tuple = tuple(
                 sorted(int(row[v]) for v in vertex_cols if row[v] is not None)
@@ -220,12 +238,15 @@ class VietorisRips:
             where simplex_tuple is a tuple of vertex indices (sorted) and birth_time is a float.
         """
 
-        if self.filtration is None:
+        if self.all_simplices_df is None:
             raise ValueError(
                 "Filtration has not been computed. Call fit_transform() first."
             )
 
-        return [s for s in self.filtration if len(s[0]) == dim + 1]
+        return [
+            (tuple(row[f"v_{i}"] for i in range(dim + 1)), row["birth_time"])
+            for row in self.all_simplices_df.filter(pl.col("dim") == dim).to_dicts()
+        ]
 
     def __create_boundary_matrix(self, simplex_to_idx):
         """
@@ -271,23 +292,38 @@ class VietorisRips:
             A dictionary mapping dimension -> list of (birth_time, death_time) tuples.
         """
 
-        num_simplices = len(self.filtration)
-        simplex_to_idx = {simplex: i for i, (simplex, _) in enumerate(self.filtration)}
+        if self.all_simplices_df is None:
+            raise ValueError(
+                "Filtration has not been computed. Call fit_transform() first."
+            )
+
+        num_simplices = self.all_simplices_df.height
         self.persistence_pairs = {}
+
+        # Pre-extract all simplex metadata
+        birth_times = (
+            self.all_simplices_df.select(pl.col("birth_time")).to_numpy().flatten()
+        )
+        dimensions = self.all_simplices_df.select(pl.col("dim")).to_numpy().flatten()
+
+        # Store vertices as a 2D matrix where missing entries are padded with -1
+        v_cols = [c for c in self.all_simplices_df.columns if c.startswith("v_")]
+        vertices_matrix = self.all_simplices_df.select(
+            [pl.col(c).fill_null(-1).cast(pl.Int64) for c in v_cols]
+        ).to_numpy()
+
+        # Build a fast reverse lookup for simplex mapping
+        simplex_to_idx = {
+            tuple(v for v in row if v != -1): i for i, row in enumerate(vertices_matrix)
+        }
+
+        # Calculate the boundary matrix
+        boundaries = self.__create_boundary_matrix(simplex_to_idx)
 
         # pivot_to_col[r] stores the column index c that has its pivot at row r (-1 means unassigned)
         pivot_to_col = np.full(num_simplices, -1, dtype=np.int32)
         # is_cycle represents if a simplex is a cycle (has no pivot)
         is_cycle = np.ones(num_simplices, dtype=np.bool_)
-
-        # Pre-extract all simplex metadata into fast numpy arrays for O(1) loop checks
-        birth_times = np.array([item[1] for item in self.filtration], dtype=np.float64)
-        dimensions = np.array(
-            [len(item[0]) - 1 for item in self.filtration], dtype=np.int32
-        )
-
-        # Calculate the boundary matrix
-        boundaries = self.__create_boundary_matrix(simplex_to_idx)
 
         # Core boundary matrix reduction Loop
         for col_idx in range(num_simplices):
