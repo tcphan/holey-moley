@@ -324,44 +324,55 @@ class VietorisRips:
         pivot_to_col = np.full(num_simplices, -1, dtype=np.int32)
         # is_cycle represents if a simplex is a cycle (has no pivot)
         is_cycle = np.ones(num_simplices, dtype=np.bool_)
+        # Track columns that are mathematically guaranteed to reduce to zero
+        cleared = np.zeros(num_simplices, dtype=np.bool_)
 
         # Core boundary matrix reduction Loop
-        for col_idx in range(num_simplices):
-            dim = dimensions[col_idx]
-            if dim == 0:
-                continue
+        for current_dim in range(self.max_dim, 0, -1):
 
-            # Local working copy of the boundary for this column
-            boundary_indices = list(boundaries[col_idx])
+            # Find all column indices belonging to the current dimension
+            col_indices = np.where(dimensions == current_dim)[0]
 
-            while boundary_indices:
-                pivot_row = boundary_indices[0]
-                other_col = pivot_to_col[pivot_row]
+            for col_idx in col_indices:
 
-                if other_col != -1:
-                    # Vectorized-style XOR operation using Python sets (highly optimized in C)
-                    boundary_indices = list(
-                        set(boundary_indices) ^ set(boundaries[other_col])
-                    )
-                    boundary_indices.sort(reverse=True)
-                else:
-                    # pivot_row is born, col_idx kills it
-                    pivot_to_col[pivot_row] = col_idx
-                    # col_idx is now a boundary, not a cycle
-                    is_cycle[col_idx] = False
+                # If this column was marked as cleared by a higher dimension, skip its reduction entirely!
+                # Its boundary becomes implicitly empty.
+                if cleared[col_idx]:
+                    continue
 
-                    birth_dim = dimensions[pivot_row]
-                    b_time = birth_times[pivot_row]
-                    d_time = birth_times[
-                        col_idx
-                    ]  # The current simplex's birth time is the death time
+                # Local working copy of the boundary for this column
+                boundary_indices = list(boundaries[col_idx])
 
-                    if birth_dim not in self.persistence_pairs:
-                        self.persistence_pairs[birth_dim] = []
+                while boundary_indices:
+                    pivot_row = boundary_indices[0]
+                    other_col = pivot_to_col[pivot_row]
 
-                    if d_time > b_time:
-                        self.persistence_pairs[birth_dim].append((b_time, d_time))
-                    break
+                    if other_col != -1:
+                        # Vectorized-style XOR operation using Python sets (highly optimized in C)
+                        boundary_indices = list(
+                            set(boundary_indices) ^ set(boundaries[other_col])
+                        )
+                        boundary_indices.sort(reverse=True)
+                    else:
+                        # pivot_row is born, col_idx kills it
+                        pivot_to_col[pivot_row] = col_idx
+                        # col_idx is now a boundary, not a cycle
+                        is_cycle[col_idx] = False
+
+                        # Clearing property: since pivot_row is a creator paired with a destroyer,
+                        # its own column is guaranteed to reduce to zero. Mark it to be skipped!
+                        cleared[pivot_row] = True
+
+                        birth_dim = dimensions[pivot_row]
+                        b_time = birth_times[pivot_row]
+                        d_time = birth_times[col_idx]
+
+                        if birth_dim not in self.persistence_pairs:
+                            self.persistence_pairs[birth_dim] = []
+
+                        if d_time > b_time:
+                            self.persistence_pairs[birth_dim].append((b_time, d_time))
+                        break
 
         # Collect essential features (unpaired cycles that live to infinity)
         for col_idx in range(num_simplices):
