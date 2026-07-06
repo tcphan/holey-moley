@@ -93,10 +93,9 @@ class VietorisRips:
 
         Returns:
         --------
-        filtration : list of tuples
-            A sorted list of simplices forming the filtration.
-            Each element is a tuple: (simplex_tuple, birth_time)
-            where simplex_tuple is a tuple of vertex indices (sorted) and birth_time is a float.
+        filtration : pl.DataFrame
+            A dataframe of simplices forming the filtration.
+            Columns: ['v_0', 'v_1', ..., 'v_n', 'birth_time', 'dim']
         """
         n_samples = df.height
         df_with_id = (
