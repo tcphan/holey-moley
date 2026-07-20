@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 import polars as pl
 import polars.selectors as cs
 
@@ -174,3 +175,110 @@ def bottleneck_distance(
             low = mid + 1  # Threshold too small, increase it
 
     return ans
+
+
+def wasserstein_distance(
+    diagram_a: list[tuple[float, float]],
+    diagram_b: list[tuple[float, float]],
+    p: float = 1.0,
+    l_distance_metric: str = "l_inf",
+) -> float:
+    """
+    Calculates the Wasserstein (Earth's mover) distance between two persistence diagrams.
+
+    Parameters:
+    -----------
+    diagram_a : list of tuples
+        The first persistence diagram. Each tuple is a pair of (birth_time, death_time).
+    diagram_b : list of tuples
+        The second persistence diagram. Each tuple is a pair of (birth_time, death_time).
+    p : float
+        The power exponent for the Wasserstein metric (p >= 1).
+    l_distance_metric : str
+        The distance metric to use for matching pairs. Options include: 'l_inf' (L-infinity) or 'l_2' (Euclidean).
+        Defaults to "l_inf".
+
+    Returns:
+    --------
+    float
+        The Wasserstein distance between the two persistence diagrams.
+    """
+
+    num_a = len(diagram_a)
+    num_b = len(diagram_b)
+
+    # Handle empty diagrams
+    if num_a == 0 and num_b == 0:
+        return 0.0
+
+    if num_a == 0 or num_b == 0:
+        return float("inf")
+
+    # Convert to DataFrames and compute diagonal projection distances
+    schema = ["birth", "death"]
+    df_a = pl.DataFrame(diagram_a, schema=schema, orient="row").with_row_index("id")
+    df_b = pl.DataFrame(diagram_b, schema=schema, orient="row").with_row_index("id")
+
+    if l_distance_metric == "l_inf":
+        diag_expr = (pl.col("death") - pl.col("birth")) / 2.0
+    elif l_distance_metric == "l_2":
+        diag_expr = (pl.col("death") - pl.col("birth")) / pl.lit(2.0).sqrt()
+    else:
+        raise ValueError("l_distance_metric must be either 'l_inf' or 'l_2'")
+
+    df_a = df_a.with_columns(diag_expr.alias("dist_to_diag"))
+    df_b = df_b.with_columns(diag_expr.alias("dist_to_diag"))
+
+    size = num_a + num_b
+    cost_matrix = np.full((size, size), np.inf)
+
+    # Block 1 (Top-Left): Pairwise costs between Diagram A and Diagram B
+    if num_a > 0 and num_b > 0:
+        # Cross join to get full mapping grid
+        grid = df_a.select(cs.all().name.suffix("_a")).join(
+            df_b.select(cs.all().name.suffix("_b")), how="cross"
+        )
+
+        if l_distance_metric == "l_inf":
+            dist_expr = pl.max_horizontal(
+                [
+                    (pl.col("birth_a") - pl.col("birth_b")).abs(),
+                    (pl.col("death_a") - pl.col("death_b")).abs(),
+                ]
+            )
+        else:
+            dist_expr = (
+                (pl.col("birth_a") - pl.col("birth_b")).pow(2)
+                + (pl.col("death_a") - pl.col("death_b")).pow(2)
+            ).sqrt()
+
+        # Calculate cost ^ p and pivot into an adjacency matrix format
+        pairwise_costs = (
+            grid.with_columns((dist_expr**p).alias("cost"))
+            .pivot(on="id_b", index="id_a", values="cost")
+            .drop("id_a")
+        )
+
+        cost_matrix[:num_a, :num_b] = pairwise_costs.to_numpy()
+
+    # Block 2 (Top-Right): Diagram A matched to their corresponding diagonal slots
+    if num_a > 0:
+        costs_diag_a = (df_a.select("dist_to_diag").to_series() ** p).to_numpy()
+        # Each point A_i maps uniquely to a dummy diagonal partner at index (num_b + i)
+        cost_matrix[np.arange(num_a), num_b + np.arange(num_a)] = costs_diag_a
+
+    # Block 3 (Bottom-Left): Diagram B matched to their corresponding diagonal slots
+    if num_b > 0:
+        costs_diag_b = (df_b.select("dist_to_diag").to_series() ** p).to_numpy()
+        # Each point B_j maps uniquely to a dummy diagonal partner at index (num_a + j)
+        cost_matrix[num_a + np.arange(num_b), np.arange(num_b)] = costs_diag_b
+
+    # Block 4 (Bottom-Right): Diagonal-to-Diagonal interactions
+    # Remain initialized as 0.0 so that surplus unmatched elements add nothing to overall cost
+    cost_matrix[num_a:, num_b:] = 0.0
+
+    # Solve matching via linear sum assignment
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+    total_cost = cost_matrix[row_ind, col_ind].sum()
+
+    return float(total_cost ** (1.0 / p))
