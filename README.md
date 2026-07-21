@@ -8,3 +8,4 @@ Each Jupyter notebook under the `notebooks` folder walks through a concrete exam
 Below is list of the currently available example use cases:
 
   1. [exploring_sdoh_w_tda.ipynb](https://github.com/tcphan/holey-moley/blob/main/notebooks/exploring_sdoh_w_tda.ipynb) : Applying TDA to visualize high-dimensional, structural differences in social determinants of health outcomes between states.
+  2. [feature_drift_detection.ipynb](https://github.com/tcphan/holey-moley/blob/main/notebooks/feature_drift_detection.ipynb) : Measuring distances between persistence diagrams to detect feature drift in high-dimensional datasets.
