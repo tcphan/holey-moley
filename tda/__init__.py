@@ -1,10 +1,13 @@
 from .rips import VietorisRips
-from .homology import PersistentHomology
 from .plotting import plot_barcode, plot_persistence_diagram
+from .distance import bottleneck_distance, wasserstein_distance
+from .homology import persistence_landscape
 
 __all__ = [
-    'VietorisRips',
-    'PersistentHomology',
-    'plot_barcode',
-    'plot_persistence_diagram'
+    "VietorisRips",
+    "plot_barcode",
+    "plot_persistence_diagram",
+    "bottleneck_distance",
+    "wasserstein_distance",
+    "persistence_landscape",
 ]
