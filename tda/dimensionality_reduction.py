@@ -1,6 +1,63 @@
 import numpy as np
 import polars as pl
-import matplotlib.pyplot as plt
+from numba import njit
+from pynndescent import NNDescent
+
+
+@njit(fastmath=True)
+def _optimize_layout_numba(
+    embedding, head, tail, weights, n_epochs, n_samples, n_components, lr, a, b
+):
+    n_edges = head.shape[0]
+
+    for epoch in range(n_epochs):
+        alpha = lr * (1.0 - epoch / n_epochs)
+
+        for e in range(n_edges):
+            i = head[e]
+            j = tail[e]
+            w = weights[e]
+
+            # Vectorized gradient distance
+            dist_sq = 0.0
+            for d in range(n_components):
+                diff = embedding[i, d] - embedding[j, d]
+                dist_sq += diff * diff
+
+            dist_sq = max(dist_sq, 1e-6)
+
+            # Attractive Force
+            attr_coeff = -(2.0 * a * b * (dist_sq ** (b - 1.0))) / (
+                1.0 + a * (dist_sq**b)
+            )
+
+            for d in range(n_components):
+                diff = embedding[i, d] - embedding[j, d]
+                grad = attr_coeff * diff * w
+                embedding[i, d] -= alpha * grad
+                embedding[j, d] += alpha * grad
+
+            # Repulsive Force (2 Negative Samples per edge)
+            for _ in range(2):
+                neg_j = np.random.randint(0, n_samples)
+                if neg_j == i:
+                    continue
+
+                neg_dist_sq = 0.0
+                for d in range(n_components):
+                    diff = embedding[i, d] - embedding[neg_j, d]
+                    neg_dist_sq += diff * diff
+
+                neg_dist_sq = max(neg_dist_sq, 1e-6)
+                rep_coeff = (2.0 * b) / (
+                    (0.001 + neg_dist_sq) * (1.0 + a * (neg_dist_sq**b))
+                )
+
+                for d in range(n_components):
+                    diff = embedding[i, d] - embedding[neg_j, d]
+                    embedding[i, d] += alpha * (rep_coeff * diff * (1.0 - w)) * 0.1
+
+    return embedding
 
 
 class UMAP:
@@ -43,72 +100,45 @@ class UMAP:
             The high-dimensional topological fuzzy simplicial set.
         """
         n_samples = X.shape[0]
+        X_np = X.to_numpy()
 
-        # 1. Pairwise Cartesian Product in Polars
-        df_x = pl.DataFrame({"i": range(n_samples), "vec_i": X.rows()})
-        df_y = pl.DataFrame({"j": range(n_samples), "vec_j": X.rows()})
+        # 1.Extract k-NN graph for each node
+        index = NNDescent(X_np, n_neighbors=self.n_neighbors, metric="euclidean")
+        index.prepare()
+        knn_indices, knn_dists = index.neighbor_graph
 
-        pairs = df_x.join(df_y, how="cross")
+        # 2. Extract local connectivity threshold rho (distance to 2nd nearest neighbor, ignoring self)
+        # knn_dists[:, 0] is distance to self (0.0)
+        rho = knn_dists[:, 1]
 
-        # 2. Compute Euclidean distances across all pairs
-        pairs = pairs.with_columns(
-            dist=pl.struct(["vec_i", "vec_j"]).map_elements(
-                lambda s: float(
-                    np.linalg.norm(np.array(s["vec_i"]) - np.array(s["vec_j"]))
-                ),
-                return_dtype=pl.Float64,
-            )
-        )
-
-        # 3. Extract k-NN graph for each node
-        knn = (
-            pairs.sort(["i", "dist"])
-            .group_by("i", maintain_order=True)
-            .head(self.n_neighbors)
-        )
-
-        # 4. Find local connectivity threshold rho_i (distance to nearest neighbor > 0)
-        rho_df = (
-            knn.filter(pl.col("dist") > 0)
-            .group_by("i")
-            .agg(pl.col("dist").min().alias("rho"))
-        )
-        knn_with_rho = knn.join(rho_df, on="i", how="left").with_columns(
-            pl.col("rho").fill_null(0.0)
-        )
-
-        # 5. Solve for sigma_i per node via binary search
+        # 3. Vectorized binary search for sigma_i per node
         target = np.log2(self.n_neighbors)
-        sigmas = []
+        lows = np.full(n_samples, 1e-3)
+        highs = np.full(n_samples, 100.0)
+        sigmas = np.ones(n_samples)
 
-        for i in range(n_samples):
-            sub = knn_with_rho.filter(pl.col("i") == i)
-            dists = sub["dist"].to_numpy()
-            rho = sub["rho"][0]
+        dists_minus_rho = np.maximum(0.0, knn_dists - rho[:, None])
 
-            low, high = 1e-3, 100.0
-            sigma = 1.0
-            for _ in range(20):
-                mid = (low + high) / 2.0
-                val = np.sum(np.exp(-np.maximum(0.0, dists - rho) / mid))
-                if val > target:
-                    high = mid
-                else:
-                    low = mid
-                sigma = mid
-            sigmas.append(sigma)
+        for _ in range(20):
+            mids = (lows + highs) / 2.0
+            vals = np.sum(np.exp(-dists_minus_rho / mids[:, None]), axis=1)
 
-        sigma_df = pl.DataFrame({"i": np.arange(n_samples), "sigma": sigmas})
-        knn_full = knn_with_rho.join(sigma_df, on="i", how="left")
+            mask = vals > target
+            highs[mask] = mids[mask]
+            lows[~mask] = mids[~mask]
+            sigmas = mids
 
-        # 6. Directional fuzzy membership strength: mu_{i->j}
-        knn_full = knn_full.with_columns(
-            mu=np.exp(
-                -np.maximum(0.0, pl.col("dist") - pl.col("rho")) / pl.col("sigma")
-            )
-        )
+        # 4. Directional fuzzy membership strength: mu_{i->j}
+        mus = np.exp(-dists_minus_rho / sigmas[:, None])
 
-        # 7. Symmetrize edge weights (Fuzzy Set Union: w = a + b - a*b)
+        # 5. Build edge list using Polars without cross-joining
+        i_indices = np.repeat(np.arange(n_samples), self.n_neighbors)
+        j_indices = knn_indices.ravel()
+        mu_weights = mus.ravel()
+
+        knn_full = pl.DataFrame({"i": i_indices, "j": j_indices, "mu": mu_weights})
+
+        # 6. Symmetrize edge weights (Fuzzy Set Union: w = a + b - a*b)
         reversed_edges = knn_full.select(
             [
                 pl.col("i").alias("j"),
@@ -151,47 +181,30 @@ class UMAP:
         """
         n_samples = X.shape[0]
 
-        # Step 1: Extract Topological Graph
+        # 1. Extract fuzzy graph
         fuzzy_edges = self._build_fuzzy_simplicial_set(X)
-        edges = fuzzy_edges.to_numpy()  # Columns: [i, j, weight]
 
-        # Step 2: Initialize low-dimensional coordinates
+        head = fuzzy_edges["i"].to_numpy().astype(np.int32)
+        tail = fuzzy_edges["j"].to_numpy().astype(np.int32)
+        weights = fuzzy_edges["weight"].to_numpy().astype(np.float32)
+
+        # 2. Initialize low-dimensional coordinates
         rng = np.random.default_rng(random_state)
         embedding = rng.normal(scale=10.0, size=(n_samples, self.n_components))
 
-        # Step 3: Optimize Layout via Fuzzy Cross-Entropy SGD
-        a, b = 1.0, 1.0  # Membership curve parameters: 1 / (1 + a * d^(2b))
-
-        for epoch in range(self.n_epochs):
-            alpha = self.lr * (1.0 - epoch / self.n_epochs)
-
-            for i_idx, j_idx, w in edges:
-                i, j = int(i_idx), int(j_idx)
-
-                diff = embedding[i] - embedding[j]
-                dist_sq = np.dot(diff, diff) + 1e-6
-
-                # Attractive Force (pull connected simplicial nodes closer)
-                attr_coeff = -(2.0 * a * b * (dist_sq ** (b - 1.0))) / (
-                    1.0 + a * (dist_sq**b)
-                )
-                grad = attr_coeff * diff * w
-
-                embedding[i] -= alpha * grad
-                embedding[j] += alpha * grad
-
-                # Repulsive Force (Negative Sampling)
-                for _ in range(2):
-                    neg_j = rng.integers(0, n_samples)
-                    if neg_j == i:
-                        continue
-                    neg_diff = embedding[i] - embedding[neg_j]
-                    neg_dist_sq = np.dot(neg_diff, neg_diff) + 1e-6
-
-                    rep_coeff = (2.0 * b) / (
-                        (0.001 + neg_dist_sq) * (1.0 + a * (neg_dist_sq**b))
-                    )
-                    embedding[i] += alpha * (rep_coeff * neg_diff * (1.0 - w)) * 0.1
+        # 3. Optimize Layout via Fuzzy Cross-Entropy SGD
+        embedding = _optimize_layout_numba(
+            embedding=embedding,
+            head=head,
+            tail=tail,
+            weights=weights,
+            n_epochs=self.n_epochs,
+            n_samples=n_samples,
+            n_components=self.n_components,
+            lr=self.lr,
+            a=1.0,
+            b=1.0,
+        )
 
         schema = [f"umap_{d + 1}" for d in range(self.n_components)]
         return pl.DataFrame(embedding, schema=schema)
